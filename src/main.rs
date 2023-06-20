@@ -1,10 +1,16 @@
 use anyhow::Result;
 use qdrant_client::prelude::*;
+use qdrant_client::qdrant::point_id::PointIdOptions;
+use qdrant_client::qdrant::value::Kind;
 use qdrant_client::qdrant::vectors_config::Config;
 use qdrant_client::qdrant::{
-    Condition, CreateCollection, Filter, SearchPoints, VectorParams, VectorsConfig, UpdateCollection,
+    Condition, CreateCollection, Filter, PointId, SearchPoints, Struct, UpdateCollection, Vector,
+    VectorParams, VectorsConfig,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::collections::HashMap;
+use std::fmt::format;
 use std::fs::File;
 use std::io::{self, BufRead};
 
@@ -39,17 +45,44 @@ async fn main() -> Result<()> {
     let file = File::open("src/startup.json")?;
     let reader = io::BufReader::new(file);
 
-    let mut startups = Vec::new();
-
-    for line in reader.lines() {
-        let line = line?;
-        let startup: Startup = serde_json::from_str(&line).unwrap();
-        startups.push(startup);
-    }
-
     // load vectors
     let bytes = std::fs::read("src/vectors.npy")?;
     let npy = npyz::NpyFile::new(&bytes[..])?;
+    let mut points: Vec<PointStruct> = vec![];
+
+    let row_length = 384; // the second dimension of your shape
+
+    for (i, (row, line)) in npy
+        .into_vec::<f32>()
+        .unwrap()
+        .chunks(row_length)
+        .zip(reader.lines())
+        .enumerate()
+    {
+        let line = line?;
+
+        eprintln!("{:?}", row);
+        let vector = qdrant_client::qdrant::Vector { data: row.into() };
+        let vectors_options = qdrant_client::qdrant::vectors::VectorsOptions::Vector(vector);
+        let new_value = qdrant_client::qdrant::Vectors {
+            vectors_options: Some(vectors_options),
+        };
+
+        let mut payload = Payload::new();
+        let startup: Startup = serde_json::from_str(&line).unwrap();
+        let startup_json: serde_json::Value = serde_json::to_value(startup).unwrap();
+        payload.insert(i, startup_json);
+
+        points.push(PointStruct {
+            id: Some((i as u64 + 1).into()),
+            payload: payload.into(),
+            vectors: Some(new_value),
+        });
+    }
+
+    client
+        .upsert_points_blocking("startups", points, None)
+        .await?;
 
     Ok(())
 }
